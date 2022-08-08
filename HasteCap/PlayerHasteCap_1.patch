@@ -1,0 +1,218 @@
+From 3d5d115f62481c35b794ef09699abea1a7d921f0 Mon Sep 17 00:00:00 2001
+From: d3athbl0w <d3athbl0w@hotmail.es>
+Date: Sat, 11 Jun 2022 11:21:45 -0400
+Subject: [PATCH] Core/Custom: Haste cap limit implemented
+
+---
+ src/server/game/Entities/Player/Player.cpp   | 54 ++++++++++++++------
+ src/server/game/Entities/Unit/Unit.cpp       | 18 ++++++-
+ src/server/game/Entities/Unit/Unit.h         |  4 +-
+ src/server/game/World/World.cpp              |  6 +++
+ src/server/game/World/World.h                |  7 +++
+ src/server/worldserver/worldserver.conf.dist | 20 ++++++++
+ 6 files changed, 90 insertions(+), 19 deletions(-)
+
+diff --git a/src/server/game/Entities/Player/Player.cpp b/src/server/game/Entities/Player/Player.cpp
+index 97989ea1b5..c8a6df2115 100644
+--- a/src/server/game/Entities/Player/Player.cpp
++++ b/src/server/game/Entities/Player/Player.cpp
+@@ -5483,31 +5483,55 @@ float Player::OCTRegenMPPerSpirit() const
+ 
+ void Player::ApplyRatingMod(CombatRating combatRating, int32 value, bool apply)
+ {
+-    float oldRating = m_baseRatingValue[combatRating];
+-    m_baseRatingValue[combatRating] += (apply ? value : -value);
++    float const oldRating = m_baseRatingValue[combatRating];
++    float newRating = m_baseRatingValue[combatRating] += (apply ? value : -value);
++    bool const atMaxHasteRating = sWorld->getIntConfig(CONFIG_MIN_HASTE_FOR_MAX_SPEED) && sWorld->getIntConfig(CONFIG_MIN_HASTE_FOR_MAX_SPEED) <= newRating;
+ 
+-    // explicit affected values
+-    float const multiplier = GetRatingMultiplier(combatRating);
+-    float const oldVal = oldRating * multiplier;
+-    float const newVal = m_baseRatingValue[combatRating] * multiplier;
+-    switch (combatRating)
++    if (sWorld->getBoolConfig(CONFIG_STATS_LIMITS_ENABLE))
+     {
++        switch (combatRating)
++        {
+         case CR_HASTE_MELEE:
+-            ApplyAttackTimePercentMod(BASE_ATTACK, oldVal, false);
+-            ApplyAttackTimePercentMod(OFF_ATTACK, oldVal, false);
+-            ApplyAttackTimePercentMod(BASE_ATTACK, newVal, true);
+-            ApplyAttackTimePercentMod(OFF_ATTACK, newVal, true);
++            newRating = newRating > sWorld->getFloatConfig(CONFIG_STATS_LIMITS_MELEE_HASTE) ? sWorld->getFloatConfig(CONFIG_STATS_LIMITS_MELEE_HASTE) : newRating;
+             break;
+         case CR_HASTE_RANGED:
+-            ApplyAttackTimePercentMod(RANGED_ATTACK, oldVal, false);
+-            ApplyAttackTimePercentMod(RANGED_ATTACK, newVal, true);
++            newRating = newRating > sWorld->getFloatConfig(CONFIG_STATS_LIMITS_RANGED_HASTE) ? sWorld->getFloatConfig(CONFIG_STATS_LIMITS_RANGED_HASTE) : newRating;
+             break;
+         case CR_HASTE_SPELL:
+-            ApplyCastTimePercentMod(oldVal, false);
+-            ApplyCastTimePercentMod(newVal, true);
++            newRating = newRating > sWorld->getFloatConfig(CONFIG_STATS_LIMITS_SPELL_HASTE) ? sWorld->getFloatConfig(CONFIG_STATS_LIMITS_SPELL_HASTE) : newRating;
+             break;
+         default:
+             break;
++        }
++    }
++
++    auto applyHasteMultiplier = [&combatRating](float val) -> float
++    {
++        return val * sWorld->getFloatConfig(CONFIG_HASTE_RATING_MULTIPLIER);
++    };
++
++    // explicit affected values
++    float const multiplier = GetRatingMultiplier(combatRating);
++    float const oldVal = oldRating * multiplier;
++    float const newVal = newRating * multiplier;
++    switch (combatRating)
++    {
++    case CR_HASTE_MELEE:
++        ApplyAttackTimePercentMod(BASE_ATTACK, applyHasteMultiplier(oldVal), false, atMaxHasteRating);
++        ApplyAttackTimePercentMod(OFF_ATTACK, applyHasteMultiplier(oldVal), false, atMaxHasteRating);
++        ApplyAttackTimePercentMod(BASE_ATTACK, applyHasteMultiplier(newVal), true, atMaxHasteRating);
++        ApplyAttackTimePercentMod(OFF_ATTACK, applyHasteMultiplier(newVal), true, atMaxHasteRating);
++        break;
++    case CR_HASTE_RANGED:
++        ApplyAttackTimePercentMod(RANGED_ATTACK, applyHasteMultiplier(oldVal), false, atMaxHasteRating);
++        ApplyAttackTimePercentMod(RANGED_ATTACK, applyHasteMultiplier(newVal), true, atMaxHasteRating);
++        break;
++    case CR_HASTE_SPELL:
++        ApplyCastTimePercentMod(applyHasteMultiplier(oldVal), false, atMaxHasteRating);
++        ApplyCastTimePercentMod(applyHasteMultiplier(newVal), true, atMaxHasteRating);
++        break;
++    default:
++        break;
+     }
+ 
+     UpdateRating(combatRating);
+diff --git a/src/server/game/Entities/Unit/Unit.cpp b/src/server/game/Entities/Unit/Unit.cpp
+index 62f8294917..181db7dfbe 100644
+--- a/src/server/game/Entities/Unit/Unit.cpp
++++ b/src/server/game/Entities/Unit/Unit.cpp
+@@ -10609,8 +10609,16 @@ void ApplyPercentModFloatVar(float& var, float val, bool apply)
+     var *= (apply ? (100.0f + val) / 100.0f : 100.0f / (100.0f + val));
+ }
+ 
+-void Unit::ApplyAttackTimePercentMod(WeaponAttackType att, float val, bool apply)
++void Unit::ApplyAttackTimePercentMod(WeaponAttackType att, float val, bool apply, bool max)
+ {
++    if (max)
++    {
++        SetFloatValue(UNIT_FIELD_BASEATTACKTIME + att, 0.0f);
++        m_modAttackSpeedPct[att] = 0.0f;
++        m_attackTimer[att] = 0;
++        return;
++    }
++
+     float amount = GetFloatValue(UNIT_FIELD_BASEATTACKTIME + att);
+ 
+     float remainingTimePct = (float)m_attackTimer[att] / (GetAttackTime(att) * m_modAttackSpeedPct[att]);
+@@ -10629,8 +10637,14 @@ void Unit::ApplyAttackTimePercentMod(WeaponAttackType att, float val, bool apply
+     m_attackTimer[att] = uint32(GetAttackTime(att) * m_modAttackSpeedPct[att] * remainingTimePct);
+ }
+ 
+-void Unit::ApplyCastTimePercentMod(float val, bool apply)
++void Unit::ApplyCastTimePercentMod(float val, bool apply, bool max)
+ {
++    if (max)
++    {
++        SetFloatValue(UNIT_MOD_CAST_SPEED, 0.0f);
++        return;
++    }
++
+     float amount = GetFloatValue(UNIT_MOD_CAST_SPEED);
+ 
+     if (val > 0.f)
+diff --git a/src/server/game/Entities/Unit/Unit.h b/src/server/game/Entities/Unit/Unit.h
+index 88075ef895..87e14ed065 100644
+--- a/src/server/game/Entities/Unit/Unit.h
++++ b/src/server/game/Entities/Unit/Unit.h
+@@ -942,8 +942,8 @@ class TC_GAME_API Unit : public WorldObject
+ 
+         uint32 GetAttackTime(WeaponAttackType att) const;
+         void SetAttackTime(WeaponAttackType att, uint32 val) { SetFloatValue(UNIT_FIELD_BASEATTACKTIME+att, val*m_modAttackSpeedPct[att]); }
+-        void ApplyAttackTimePercentMod(WeaponAttackType att, float val, bool apply);
+-        void ApplyCastTimePercentMod(float val, bool apply);
++        void ApplyAttackTimePercentMod(WeaponAttackType att, float val, bool apply, bool max = false);
++        void ApplyCastTimePercentMod(float val, bool apply, bool max = false);
+ 
+         void SetModCastingSpeed(float castingSpeed) { SetFloatValue(UNIT_MOD_CAST_SPEED, castingSpeed); }
+ 
+diff --git a/src/server/game/World/World.cpp b/src/server/game/World/World.cpp
+index 7c504d78a3..5880f38413 100644
+--- a/src/server/game/World/World.cpp
++++ b/src/server/game/World/World.cpp
+@@ -1535,6 +1535,12 @@ void World::LoadConfigSettings(bool reload)
+     m_float_configs[CONFIG_STATS_LIMITS_PARRY] = sConfigMgr->GetFloatDefault("Stats.Limits.Parry", 95.0f);
+     m_float_configs[CONFIG_STATS_LIMITS_BLOCK] = sConfigMgr->GetFloatDefault("Stats.Limits.Block", 95.0f);
+     m_float_configs[CONFIG_STATS_LIMITS_CRIT] = sConfigMgr->GetFloatDefault("Stats.Limits.Crit", 95.0f);
++    m_float_configs[CONFIG_STATS_LIMITS_MELEE_HASTE] = sConfigMgr->GetFloatDefault("Stats.Limits.Melee.Haste", 1000.0f);
++    m_float_configs[CONFIG_STATS_LIMITS_RANGED_HASTE] = sConfigMgr->GetFloatDefault("Stats.Limits.Ranged.Haste", 1000.0f);
++    m_float_configs[CONFIG_STATS_LIMITS_SPELL_HASTE] = sConfigMgr->GetFloatDefault("Stats.Limits.Spell.Haste", 1000.0f);
++
++    m_float_configs[CONFIG_HASTE_RATING_MULTIPLIER] = sConfigMgr->GetFloatDefault("Stats.Haste.Multiplier", 1.0f);
++    m_int_configs[CONFIG_MIN_HASTE_FOR_MAX_SPEED] = sConfigMgr->GetIntDefault("Stats.Haste.Max", 1000);
+ 
+     //packet spoof punishment
+     m_int_configs[CONFIG_PACKET_SPOOF_POLICY] = sConfigMgr->GetIntDefault("PacketSpoof.Policy", (uint32)WorldSession::DosProtection::POLICY_KICK);
+diff --git a/src/server/game/World/World.h b/src/server/game/World/World.h
+index e5fb3fffd8..7beb5fd4a2 100644
+--- a/src/server/game/World/World.h
++++ b/src/server/game/World/World.h
+@@ -223,6 +223,12 @@ enum WorldFloatConfigs
+     CONFIG_ARENA_MATCHMAKER_RATING_MODIFIER,
+     CONFIG_RESPAWN_DYNAMICRATE_CREATURE,
+     CONFIG_RESPAWN_DYNAMICRATE_GAMEOBJECT,
++
++    CONFIG_HASTE_RATING_MULTIPLIER,
++    CONFIG_STATS_LIMITS_MELEE_HASTE,
++    CONFIG_STATS_LIMITS_RANGED_HASTE,
++    CONFIG_STATS_LIMITS_SPELL_HASTE,
++
+     FLOAT_CONFIG_VALUE_COUNT
+ };
+ 
+@@ -426,6 +432,7 @@ enum WorldIntConfigs
+     CONFIG_RESPAWN_DYNAMICMINIMUM_GAMEOBJECT,
+     CONFIG_RESPAWN_GUIDWARNING_FREQUENCY,
+     CONFIG_SOCKET_TIMEOUTTIME_ACTIVE,
++	CONFIG_MIN_HASTE_FOR_MAX_SPEED,
+     CONFIG_PENDING_MOVE_CHANGES_TIMEOUT,
+     INT_CONFIG_VALUE_COUNT
+ };
+diff --git a/src/server/worldserver/worldserver.conf.dist b/src/server/worldserver/worldserver.conf.dist
+index 4af5e5f798..2593bd9163 100644
+--- a/src/server/worldserver/worldserver.conf.dist
++++ b/src/server/worldserver/worldserver.conf.dist
+@@ -2545,6 +2545,26 @@ DurabilityLossChance.Absorb = 0.5
+ 
+ DurabilityLossChance.Parry = 0.05
+ 
++#    Stats.Limit.HASTE
++#        Description: Set a fixed amount for max haste. Haste rating cannot go above this.
++#        Default:     1000.0
++
++Stats.Limits.Melee.Haste  = 1000.0
++Stats.Limits.Ranged.Haste = 1000.0
++Stats.Limits.Spell.Haste  = 1000.0
++
++#    Stats.Haste.Multiplier
++#        Description: Haste multiplier for rating calculation.
++#        Default:     1.0
++
++Stats.Haste.Multiplier = 1.0
++
++#    Stats.Haste.Max
++#        Description: If player reaches this amount of haste rating, he gets 0.0 attack/cast speed.
++#        Default:     1000
++
++Stats.Haste.Max = 1000
++
+ #
+ #    DurabilityLossChance.Block
+ #        Description: Chance to lose durability on shield when blocking attacks.
+-- 
+2.36.1.windows.1
+
